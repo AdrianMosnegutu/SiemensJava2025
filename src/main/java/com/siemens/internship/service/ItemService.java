@@ -5,22 +5,30 @@ import com.siemens.internship.repository.ItemRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 @Service
 public class ItemService {
+    private static final Logger logger = LoggerFactory.getLogger(ItemService.class);
     private static final ExecutorService executor = Executors.newFixedThreadPool(10);
-    private final List<Item> processedItems = new ArrayList<>();
+    private final ConcurrentHashMap<Long, Item> processedItems = new ConcurrentHashMap<>();
+
+    private final ItemRepository itemRepository;
 
     @Autowired
-    private ItemRepository itemRepository;
-    private int processedCount = 0;
+    public ItemService(ItemRepository itemRepository) {
+        this.itemRepository = itemRepository;
+    }
 
     public List<Item> findAll() {
         return itemRepository.findAll();
@@ -30,8 +38,19 @@ public class ItemService {
         return itemRepository.findById(id);
     }
 
+    /**
+     * Saves an item to the database.
+     * @param item The item to save
+     * @return The saved item
+     * @throws DataIntegrityViolationException if the email is already in use
+     */
     public Item save(Item item) {
-        return itemRepository.save(item);
+        try {
+            return itemRepository.save(item);
+        } catch (DataIntegrityViolationException e) {
+            logger.error("Failed to save item: Email {} is already in use", item.getEmail());
+            throw new DataIntegrityViolationException("Email is already in use");
+        }
     }
 
     public void deleteById(Long id) {
@@ -39,48 +58,54 @@ public class ItemService {
     }
 
     /**
-     * Your Tasks
-     * Identify all concurrency and asynchronous programming issues in the code
-     * Fix the implementation to ensure:
-     * All items are properly processed before the CompletableFuture completes
-     * Thread safety for all shared state
-     * Proper error handling and propagation
-     * Efficient use of system resources
-     * Correct use of Spring's @Async annotation
-     * Add appropriate comments explaining your changes and why they fix the issues
-     * Write a brief explanation of what was wrong with the original implementation
-     * <p>
-     * Hints
-     * Consider how CompletableFuture composition can help coordinate multiple async operations
-     * Think about appropriate thread-safe collections
-     * Examine how errors are handled and propagated
-     * Consider the interaction between Spring's @Async and CompletableFuture
+     * Asynchronously processes all items in the database.
+     * This method:
+     * 1. Retrieves all item IDs from the database
+     * 2. Processes each item asynchronously
+     * 3. Updates the status of each item to "PROCESSED"
+     * 4. Tracks successfully processed items
+     * 5. Returns a list of all processed items when complete
+     *
+     * @return List of successfully processed items
      */
     @Async
     public List<Item> processItemsAsync() {
         List<Long> itemIds = itemRepository.findAllIds();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         for (Long id : itemIds) {
-            CompletableFuture.runAsync(() -> {
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 try {
+                    // Simulate processing time
                     Thread.sleep(100);
 
-                    Item item = itemRepository.findById(id).orElse(null);
-                    if (item == null) {
+                    Optional<Item> itemOpt = itemRepository.findById(id);
+                    if (!itemOpt.isPresent()) {
+                        logger.warn("Item with ID {} not found", id);
                         return;
                     }
 
-                    processedCount++;
-
+                    Item item = itemOpt.get();
                     item.setStatus("PROCESSED");
-                    itemRepository.save(item);
-                    processedItems.add(item);
+
+                    Item savedItem = itemRepository.save(item);
+                    processedItems.put(id, savedItem);
+
+                    logger.info("Successfully processed item with ID: {}", id);
                 } catch (InterruptedException e) {
-                    System.out.println("Error: " + e.getMessage());
+                    logger.error("Processing interrupted for item ID {}: {}", id, e.getMessage());
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    logger.error("Error processing item ID {}: {}", id, e.getMessage());
                 }
             }, executor);
+            futures.add(future);
         }
 
-        return processedItems;
+        // Wait for all futures to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        // Return list of processed items
+        return new ArrayList<>(processedItems.values());
     }
 }
